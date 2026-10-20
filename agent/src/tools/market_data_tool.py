@@ -85,10 +85,10 @@ class MarketDataTool(BaseTool):
         "Use this for stock, ETF, index, or crypto price bars before writing raw "
         "yfinance/OKX/Tushare scripts. Volume units are source- and market-dependent "
         "(A-share sources report board lots of 100 shares, HK/US sources report single "
-        "shares); read the per-symbol _provenance.volume_unit field ('lots' / 'shares' / "
+        "shares); read _provenance.symbol_provenance[code].volume_unit ('lots' / 'shares' / "
         "null=undeclared) before interpreting or comparing volume values. Price caliber "
         "is source-dependent too (some sources adjust for splits/dividends, others serve "
-        "raw quotes); read _provenance.adjustment ('raw' / 'split' / 'split_dividend' / "
+        "raw quotes); read _provenance.symbol_provenance[code].adjustment ('raw' / 'split' / 'split_dividend' / "
         "'split_dividend_additive' / 'na' / 'unknown') before comparing price levels "
         "across symbols. 'split_dividend_additive' (the A-share qfq of Tencent, Eastmoney and AKShare) adjusts "
         "dividends by shifting the price level rather than scaling it, so it is not on "
@@ -238,6 +238,7 @@ class MarketDataTool(BaseTool):
             "interval": normalized_interval,
             "max_rows": max_rows,
             "include_provenance": True,
+            "provenance_detail": "full",
         }
         loader_resolver = kwargs.get("loader_resolver")
         if loader_resolver is not None:

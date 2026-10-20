@@ -1916,13 +1916,13 @@ def get_market_data(
 
     Volume units: the ``volume`` column unit is source- and market-dependent
     (A-share sources report board lots of 100 shares; HK/US sources report
-    single shares). Each symbol's ``_provenance.volume_unit`` states the unit
+    single shares). Each symbol's ``_provenance.symbol_provenance[code].volume_unit`` states the unit
     of the returned rows ("lots" / "shares"; null = source undeclared) — read
     it before interpreting or comparing volume values across symbols/sources.
 
     Price caliber: which source served a symbol decides what its prices mean
     (some adjust for splits and dividends, others serve raw quotes). Each
-    symbol's ``_provenance.adjustment`` states the caliber ("raw" / "split" /
+    symbol's ``_provenance.symbol_provenance[code].adjustment`` states the caliber ("raw" / "split" /
     "split_dividend" / "split_dividend_additive" / "na" / "unknown") — read it
     before comparing price levels across symbols. Note that
     ``split_dividend_additive`` (the A-share qfq of Tencent, Eastmoney and AKShare) adjusts dividends by
@@ -2233,8 +2233,17 @@ def get_research_reports(
 
 
 @mcp.tool
-def get_stock_news(code: str | None = None, scope: str = "stock", limit: int = 20) -> str:
+def get_stock_news(
+    code: str | None = None,
+    scope: str = "stock",
+    limit: int = 20,
+    cutoff: str | None = None,
+    require_related_ticker: bool = False,
+) -> str:
     """Fetch recent financial news headlines, read-only and no auth.
+
+    Yahoo and Eastmoney headlines are discovery-only evidence. Read the source
+    directly and verify independently before stating an issuer fact.
 
     Markets: China A-share (SH/SZ/BJ) headlines from Eastmoney; US (.US) and
     Hong Kong (.HK) related-instrument matches from Yahoo Finance. Use scope
@@ -2246,8 +2255,17 @@ def get_stock_news(code: str | None = None, scope: str = "stock", limit: int = 2
             Required when scope="stock"; ignored when scope="global".
         scope: "stock" (default) or "global".
         limit: Maximum number of headlines to return.
+        cutoff: Optional timezone-aware ISO-8601 publication cutoff. Yahoo
+            applies it to provider timestamps; Eastmoney cannot normalize it.
+        require_related_ticker: Yahoo-only provider related-ticker filter.
+            A match improves relevance but does not verify an issuer fact.
     """
-    params: dict[str, Any] = {"scope": scope, "limit": limit}
+    params: dict[str, Any] = {
+        "scope": scope,
+        "limit": limit,
+        "cutoff": cutoff,
+        "require_related_ticker": require_related_ticker,
+    }
     if code:
         params["code"] = code
     registry = _get_registry()

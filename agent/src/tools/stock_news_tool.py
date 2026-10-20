@@ -62,7 +62,7 @@ def _clamp_limit(raw: Any) -> int:
 
     Returns:
         An integer in ``[1, _MAX_LIMIT]``, falling back to ``_DEFAULT_LIMIT``
-        when ``raw`` is missing or non-numeric.
+        when *raw* is missing or non-numeric.
     """
     try:
         value = int(raw)
@@ -71,6 +71,68 @@ def _clamp_limit(raw: Any) -> int:
     if value < 1:
         return 1
     return min(value, _MAX_LIMIT)
+
+
+def _parse_cutoff(raw: Any) -> datetime | None:
+    """Parse an optional timezone-aware ISO-8601 cutoff into UTC."""
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("cutoff must be a timezone-aware ISO-8601 string")
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("cutoff must be a timezone-aware ISO-8601 string") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("cutoff must include a timezone offset")
+    return parsed.astimezone(timezone.utc)
+
+
+def _iso_or_none(value: datetime | None) -> str | None:
+    """Serialize an optional UTC datetime as an explicit ISO value."""
+    return value.isoformat().replace("+00:00", "Z") if value is not None else None
+
+
+def _discovery_evidence(
+    *,
+    source: str,
+    query: str | None = None,
+    cutoff: datetime | None = None,
+    cutoff_applied: bool = False,
+    cutoff_note: str | None = None,
+    related_ticker_filter: str | None = None,
+    related_ticker_matches: int | None = None,
+    related_ticker_mismatches: int | None = None,
+    related_ticker_unverified: int | None = None,
+    cutoff_excluded: int | None = None,
+) -> dict[str, Any]:
+    """Build a common discovery-only evidence status for news payloads."""
+    evidence: dict[str, Any] = {
+        "status": "discovery_only",
+        "source_role": "news_discovery",
+        "source": source,
+        "requires_direct_read": True,
+        "cutoff": _iso_or_none(cutoff),
+        "cutoff_applied": cutoff_applied,
+    }
+    if query is not None:
+        evidence["query"] = query
+    if cutoff_note:
+        evidence["cutoff_note"] = cutoff_note
+    if related_ticker_filter is not None:
+        evidence["related_ticker_filter"] = related_ticker_filter
+    if related_ticker_matches is not None:
+        evidence["related_ticker_matches"] = related_ticker_matches
+    if related_ticker_mismatches is not None:
+        evidence["related_ticker_mismatches"] = related_ticker_mismatches
+    if related_ticker_unverified is not None:
+        evidence["related_ticker_unverified"] = related_ticker_unverified
+    if cutoff_excluded is not None:
+        evidence["cutoff_excluded"] = cutoff_excluded
+    return evidence
 
 
 def _suffix_of(code: str) -> str:
@@ -223,23 +285,73 @@ def _yahoo_article(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _fetch_yahoo_news(query: str, limit: int) -> list[dict[str, Any]]:
-    """Fetch US/HK news articles for a query via Yahoo search.
+def _related_ticker_match(raw: dict[str, Any], query: str) -> bool | None:
+    """Return Yahoo's explicit related-ticker match, or ``None`` if absent."""
+    related = raw.get("relatedTickers")
+    if not isinstance(related, list):
+        return None
+    normalized = {
+        str(item).strip().upper().split(".", 1)[0]
+        for item in related
+        if isinstance(item, (str, int, float))
+    }
+    return query.strip().upper() in normalized
 
-    Args:
-        query: Free-text search term (bare ticker or keyword).
-        limit: Maximum number of records to return.
 
-    Returns:
-        A capped list of compact article records; empty when none.
+def _fetch_yahoo_news(
+    query: str,
+    limit: int,
+    *,
+    cutoff: datetime | None = None,
+    require_related_ticker: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Fetch US/HK news and expose cutoff/ticker-relevance accounting.
 
-    Raises:
-        requests.RequestException: Network/HTTP failure, propagated to caller.
+    Yahoo Search remains a discovery source. The returned article records retain
+    the historical shape for compatibility; the second return value records
+    how many provider related-ticker flags matched, mismatched, were missing,
+    or were excluded by a caller cutoff.
     """
     articles = yahoo_client.search_news(query, limit)
-    return [
-        _yahoo_article(article) for article in articles if isinstance(article, dict)
-    ][:limit]
+    stats = {
+        "related_ticker_matches": 0,
+        "related_ticker_mismatches": 0,
+        "related_ticker_unverified": 0,
+        "cutoff_excluded": 0,
+        "relevance_rejected": 0,
+    }
+    cutoff_epoch = cutoff.timestamp() if cutoff is not None else None
+    selected: list[dict[str, Any]] = []
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        try:
+            published_raw = article.get("providerPublishTime")
+            published_epoch = (
+                float(published_raw) if published_raw is not None else None
+            )
+        except (TypeError, ValueError):
+            published_epoch = None
+        if cutoff_epoch is not None and (
+            published_epoch is None or published_epoch > cutoff_epoch
+        ):
+            stats["cutoff_excluded"] += 1
+            continue
+
+        relation = _related_ticker_match(article, query)
+        if relation is True:
+            stats["related_ticker_matches"] += 1
+        elif relation is False:
+            stats["related_ticker_mismatches"] += 1
+        else:
+            stats["related_ticker_unverified"] += 1
+        if require_related_ticker and relation is not True:
+            stats["relevance_rejected"] += 1
+            continue
+        selected.append(_yahoo_article(article))
+        if len(selected) >= limit:
+            break
+    return selected, stats
 
 
 class StockNewsTool(BaseTool):
@@ -247,14 +359,17 @@ class StockNewsTool(BaseTool):
 
     name = "get_stock_news"
     description = (
-        "Fetch recent financial news headlines, read-only and no auth. Markets: "
-        "China A-share (SH/SZ/BJ) returns Eastmoney news ARTICLES "
-        "(title/url/source/published/snippet) under 'articles'. US (.US), Hong "
-        "Kong (.HK) and Brazil (B3 .SA) return Yahoo Finance news articles with "
-        "the same fields. Use "
-        "scope 'stock' with a 'code', or scope 'global' (no code) for broad "
-        "China-market finance articles. "
-        'Example: {"code": "600519.SH", "scope": "stock", "limit": 10}.'
+        "Fetch recent financial news headlines, read-only and no auth. Yahoo "
+        "Finance Search and Eastmoney are discovery sources only: returned items "
+        "must be directly read and independently verified before being stated as "
+        "company, regulatory, or issuer facts. Markets: China A-share "
+        "(SH/SZ/BJ) returns Eastmoney news ARTICLES; US (.US), Hong Kong (.HK) "
+        "and Brazil (B3 .SA) return Yahoo Finance news articles. Use scope "
+        "'stock' with a 'code', or scope 'global' (no code) for broad "
+        "China-market finance articles. Optional cutoff is timezone-aware "
+        "ISO-8601; Yahoo can also require an explicit related-ticker match. "
+        'Example: {"code": "AAPL.US", "scope": "stock", "limit": 10, '
+        '"cutoff": "2026-08-03T21:00:00Z"}.'
     )
     parameters = {
         "type": "object",
@@ -284,6 +399,23 @@ class StockNewsTool(BaseTool):
                 ),
                 "default": _DEFAULT_LIMIT,
             },
+            "cutoff": {
+                "type": "string",
+                "description": (
+                    "Optional timezone-aware ISO-8601 publication cutoff. Yahoo "
+                    "filters providerPublishTime at or before this cutoff; a "
+                    "timezone is required."
+                ),
+            },
+            "require_related_ticker": {
+                "type": "boolean",
+                "description": (
+                    "Yahoo only: when true, retain articles whose provider "
+                    "relatedTickers explicitly include the queried ticker. "
+                    "Default false because this is a discovery filter, not issuer verification."
+                ),
+                "default": False,
+            },
         },
         "required": [],
     }
@@ -293,7 +425,9 @@ class StockNewsTool(BaseTool):
 
         Args:
             **kwargs: ``scope`` ('stock' | 'global', default 'stock'), ``code``
-                (required when scope='stock'), and optional ``limit`` (1-50).
+                (required when scope='stock'), optional ``limit`` (1-50), an
+                optional timezone-aware ISO-8601 ``cutoff``, and the Yahoo-only
+                ``require_related_ticker`` filter.
 
         Returns:
             A JSON string envelope. On success:
@@ -306,40 +440,56 @@ class StockNewsTool(BaseTool):
                 f"invalid scope: {scope!r}; expected 'stock' or 'global'"
             )
 
+        try:
+            cutoff = _parse_cutoff(kwargs.get("cutoff"))
+        except ValueError as exc:
+            return self._error(str(exc))
         limit = _clamp_limit(kwargs.get("limit"))
+        require_related_ticker = kwargs.get("require_related_ticker") is True
 
         if scope == "global":
-            return self._run_global(limit)
-        return self._run_stock(kwargs.get("code"), limit)
+            return self._run_global(limit, cutoff)
+        return self._run_stock(
+            kwargs.get("code"), limit, cutoff, require_related_ticker
+        )
 
-    def _run_global(self, limit: int) -> str:
-        """Fetch broad China-market headlines from Eastmoney.
-
-        Args:
-            limit: Maximum number of headlines.
-
-        Returns:
-            A success or error JSON envelope.
-        """
+    def _run_global(self, limit: int, cutoff: datetime | None = None) -> str:
+        """Fetch broad China-market headlines from Eastmoney."""
         try:
             articles = _fetch_eastmoney_news(_GLOBAL_QUERY, limit)
         except Exception as exc:  # noqa: BLE001 - surface any fetch failure as envelope
             logger.warning("global news fetch failed: %s", exc)
             return self._error(f"eastmoney news fetch failed: {exc}")
+        evidence = _discovery_evidence(
+            source="eastmoney",
+            query=_GLOBAL_QUERY,
+            cutoff=cutoff,
+            cutoff_note=(
+                "Eastmoney publication timestamps are not normalized by this tool; "
+                "caller cutoff was not applied"
+                if cutoff is not None
+                else None
+            ),
+        )
         return self._ok(
-            "global", "eastmoney", {"scope": "global", "articles": articles}
+            "global",
+            "eastmoney",
+            {
+                "scope": "global",
+                "articles": articles,
+                "evidence": evidence,
+                "retrieved_at": _iso_or_none(datetime.now(timezone.utc)),
+            },
         )
 
-    def _run_stock(self, code_arg: Any, limit: int) -> str:
-        """Fetch single-security headlines, routing by exchange suffix.
-
-        Args:
-            code_arg: Raw ``code`` argument (any type).
-            limit: Maximum number of headlines.
-
-        Returns:
-            A success or error JSON envelope.
-        """
+    def _run_stock(
+        self,
+        code_arg: Any,
+        limit: int,
+        cutoff: datetime | None = None,
+        require_related_ticker: bool = False,
+    ) -> str:
+        """Fetch single-security headlines, routing by exchange suffix."""
         if not isinstance(code_arg, str) or not code_arg.strip():
             return self._error(
                 "missing required parameter: code (required when scope='stock')"
@@ -352,43 +502,100 @@ class StockNewsTool(BaseTool):
             return self._error(f"invalid code: {code!r}")
 
         if suffix in _EM_SUFFIXES:
-            return self._stock_via_eastmoney(code, query, limit)
+            return self._stock_via_eastmoney(code, query, limit, cutoff)
         if suffix in _YAHOO_SUFFIXES:
             # A bare B3 code (PETR4) is ambiguous on Yahoo search; its own
             # spelling (PETR4.SA) is the listing.
             if suffix == "SA":
                 query = code.upper()
-            return self._stock_via_yahoo(code, query, limit)
+            return self._stock_via_yahoo(
+                code, query, limit, cutoff, require_related_ticker
+            )
         return self._error(
             f"unsupported market for code {code!r}; expected suffix in "
             f"{_EM_SUFFIXES + _YAHOO_SUFFIXES}"
         )
 
-    def _stock_via_eastmoney(self, code: str, query: str, limit: int) -> str:
+    def _stock_via_eastmoney(
+        self,
+        code: str,
+        query: str,
+        limit: int,
+        cutoff: datetime | None = None,
+    ) -> str:
         """Fetch A-share headlines from Eastmoney for one code."""
         try:
             articles = _fetch_eastmoney_news(query, limit)
         except Exception as exc:  # noqa: BLE001 - surface any fetch failure as envelope
             logger.warning("eastmoney news fetch failed for %s: %s", code, exc)
             return self._error(f"eastmoney news fetch failed: {exc}")
+        evidence = _discovery_evidence(
+            source="eastmoney",
+            query=query,
+            cutoff=cutoff,
+            cutoff_note=(
+                "Eastmoney publication timestamps are not normalized by this tool; "
+                "caller cutoff was not applied"
+                if cutoff is not None
+                else None
+            ),
+        )
         return self._ok(
             "a_share",
             "eastmoney",
-            {"scope": "stock", "code": code, "articles": articles},
+            {
+                "scope": "stock",
+                "code": code,
+                "articles": articles,
+                "evidence": evidence,
+                "retrieved_at": _iso_or_none(datetime.now(timezone.utc)),
+            },
         )
 
-    def _stock_via_yahoo(self, code: str, query: str, limit: int) -> str:
+    def _stock_via_yahoo(
+        self,
+        code: str,
+        query: str,
+        limit: int,
+        cutoff: datetime | None = None,
+        require_related_ticker: bool = False,
+    ) -> str:
         """Fetch US/HK news articles from Yahoo for one code."""
         market = {"HK": "hk", "SA": "br"}.get(_suffix_of(code), "us")
         try:
-            articles = _fetch_yahoo_news(query, limit)
+            articles, stats = _fetch_yahoo_news(
+                query,
+                limit,
+                cutoff=cutoff,
+                require_related_ticker=require_related_ticker,
+            )
         except Exception as exc:  # noqa: BLE001 - surface any fetch failure as envelope
             logger.warning("yahoo news fetch failed for %s: %s", code, exc)
             return self._error(f"yahoo news fetch failed: {exc}")
+        evidence = _discovery_evidence(
+            source="yahoo_finance_search",
+            query=query,
+            cutoff=cutoff,
+            cutoff_applied=cutoff is not None,
+            related_ticker_filter=(
+                "required" if require_related_ticker else "reported_only"
+            ),
+            related_ticker_matches=stats["related_ticker_matches"],
+            related_ticker_mismatches=stats["related_ticker_mismatches"],
+            related_ticker_unverified=stats["related_ticker_unverified"],
+            cutoff_excluded=stats["cutoff_excluded"],
+        )
+        evidence["relevance_rejected"] = stats["relevance_rejected"]
         return self._ok(
             market,
             "yahoo",
-            {"scope": "stock", "code": code, "articles": articles},
+            {
+                "scope": "stock",
+                "code": code,
+                "articles": articles,
+                "evidence": evidence,
+                "retrieved_at": _iso_or_none(datetime.now(timezone.utc)),
+            },
         )
 
     @staticmethod

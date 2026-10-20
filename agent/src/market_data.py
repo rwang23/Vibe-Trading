@@ -7,11 +7,14 @@ import logging
 import math
 import re
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ROWS = 250
+PROVENANCE_KEY = "_provenance"
+PROVENANCE_SCHEMA = "market-data-provenance-v1"
 
 # Symbol -> preferred source. The matched source is a member of its market's
 # fallback chain (registry.FALLBACK_CHAINS), so an unavailable preferred source
@@ -196,6 +199,40 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _utc_now() -> str:
+    """Return the retrieval time in UTC for the evidence envelope."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _provider_family(source: str | None) -> str | None:
+    if source in {"yahoo", "yfinance"}:
+        return "yahoo"
+    return source
+
+
+def _error_code(exc: Exception, *, unavailable: bool = False) -> str:
+    """Expose a useful failure category without copying provider error text."""
+    if unavailable:
+        return "source_unavailable"
+    message = str(exc).lower()
+    if "401" in message or "unauthorized" in message:
+        return "http_401"
+    if "429" in message or "rate limit" in message or "too many requests" in message:
+        return "http_429"
+    if "timeout" in message or "timed out" in message:
+        return "timeout"
+    return "provider_error"
+
+
+def _frame_tail(frame: Any) -> str | None:
+    try:
+        if frame is None or len(frame.index) == 0:
+            return None
+        return _json_safe(frame.index[-1])
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
 def fetch_market_data(
     *,
     codes: list[str],
@@ -209,6 +246,7 @@ def fetch_market_data(
     max_fallback_attempts: int = 5,
     include_provenance: bool = False,
     as_frames: bool = False,
+    provenance_detail: str = "basic",
 ) -> dict[str, Any]:
     """Fetch normalized OHLCV data through the repository loader layer.
 
@@ -226,7 +264,9 @@ def fetch_market_data(
     declared by the serving loader for that market (``"lots"`` = board lots of
     100 shares, ``"shares"`` = single shares, ``None`` = undeclared). Volume
     units are source- and market-dependent (HKUDS/Vibe-Trading#1062), so
-    consumers must read this field instead of assuming a unit.
+    consumers must read this field instead of assuming a unit. With
+    ``provenance_detail="full"``, the per-symbol fields are retained under
+    ``_provenance.symbol_provenance`` beside the actual fallback attempt log.
     """
     from backtest.engines._market_hooks import _detect_market
     from backtest.loaders.base import NoAvailableSourceError, resample_bars, source_interval
@@ -247,6 +287,13 @@ def fetch_market_data(
     results: dict[str, Any] = {}
     provenance: dict[str, dict[str, Any]] = {}
     diagnostics: dict[str, list[dict[str, str]]] = {}
+    full_provenance = include_provenance and provenance_detail == "full"
+    retrieved_at = _utc_now() if full_provenance else None
+    group_runs: list[dict[str, Any]] = []
+    group_for_code: dict[str, dict[str, Any]] = {}
+    row_counts: dict[str, int] = {}
+    latest_by_symbol: dict[str, str | None] = {}
+    truncated_symbols: set[str] = set()
     result_aliases = {
         code: code.split(":", 1)[1]
         if code.lower().startswith("local:")
@@ -283,11 +330,15 @@ def fetch_market_data(
 
     def _fetch_via_chain(
         src: str, market: str, src_codes: list[str]
-    ) -> tuple[dict[str, Any], str | None, type | None, dict[str, tuple[str, type]]]:
+    ) -> tuple[
+        dict[str, Any], str | None, type | None,
+        dict[str, tuple[str, type]], list[dict[str, Any]],
+    ]:
         """Run the ordered source chain for one group, per symbol.
 
-        Returns ``(data_map, used_source, provider_cls, symbol_sources)`` —
-        ``data_map`` keyed by requested symbol -> OHLCV non-empty frame, ``used_source``/``provider_cls`` the first source that served
+        Returns ``(data_map, used_source, provider_cls, symbol_sources, attempts)`` —
+        ``data_map`` keyed by requested symbol -> OHLCV frame (possibly
+        empty), ``used_source``/``provider_cls`` the first source that served
         anything (``None`` when every attempt failed), and ``symbol_sources``
         mapping each served symbol to the source that actually served it. A
         partially successful attempt no longer stops the walk: symbols the
@@ -326,6 +377,7 @@ def fetch_market_data(
 
         data_map: dict[str, Any] = {}
         symbol_sources: dict[str, tuple[str, type]] = {}
+        attempt_records: list[dict[str, Any]] = []
         used_source: str | None = None
         provider_cls: type | None = None
         remaining = list(dict.fromkeys(src_codes))
@@ -337,15 +389,31 @@ def fetch_market_data(
         for attempt_src in attempts:
             if not remaining:
                 break
+            attempt_record: dict[str, Any] = {
+                "source": attempt_src,
+                "provider_family": _provider_family(attempt_src),
+                "requested_symbols": list(remaining),
+            }
+            attempt_records.append(attempt_record)
             try:
                 loader_cls = loader_resolver(attempt_src)
             except NoAvailableSourceError as exc:
                 record(remaining, attempt_src, "source_unavailable")
-                logger.debug("loader %r unavailable: %s", attempt_src, exc)
+                attempt_record.update({
+                    "status": "unavailable",
+                    "error_type": type(exc).__name__,
+                    "error_code": _error_code(exc, unavailable=True),
+                })
+                logger.debug("loader %r unavailable; error_type=%s", attempt_src, type(exc).__name__)
                 continue
             except Exception as exc:  # noqa: BLE001 — resolver may raise for non-network reasons
                 record(remaining, attempt_src, "source_unavailable")
-                logger.debug("loader %r resolver failed: %s", attempt_src, exc)
+                attempt_record.update({
+                    "status": "resolver_error",
+                    "error_type": type(exc).__name__,
+                    "error_code": _error_code(exc),
+                })
+                logger.debug("loader %r resolver failed; error_type=%s", attempt_src, type(exc).__name__)
                 continue
             serving_source = getattr(loader_cls, "name", None) or attempt_src
             if serving_source in attempted_providers:
@@ -374,18 +442,28 @@ def fetch_market_data(
                         partial.pop(normalized, None)
             except Exception as exc:  # noqa: BLE001 — contained per-symbol fallback
                 record(remaining, serving_source, "fetch_failed")
+                attempt_record.update({
+                    "status": "fetch_error",
+                    "error_type": type(exc).__name__,
+                    "error_code": _error_code(exc),
+                })
                 logger.error(
-                    "market-data loader %r failed for %s; trying next source in chain: %s",
-                    attempt_src, remaining, exc,
+                    "market-data loader %r failed for %s; trying next source; error_type=%s",
+                    attempt_src, remaining, type(exc).__name__,
                 )
                 continue
             if not partial:
                 record(remaining, serving_source, "no_data")
+                attempt_record.update({"status": "empty_payload", "error_code": "empty_payload"})
                 continue
             record([symbol for symbol in remaining if symbol not in partial], serving_source, "no_data")
             # The resolver can substitute an unavailable optional loader before
             # fetch runs. Attribute every returned symbol to its actual provider.
             serving_source = getattr(loader_cls, "name", None) or attempt_src
+            attempt_record.update({
+                "status": "ok",
+                "resolved_symbols": sorted(str(symbol) for symbol in partial),
+            })
             if used_source is None:
                 used_source = serving_source
                 provider_cls = loader_cls
@@ -407,7 +485,7 @@ def fetch_market_data(
                 "market-data per-symbol fallback: %s served the remaining symbols %r could not",
                 served_elsewhere, src,
             )
-        return data_map, used_source, provider_cls, symbol_sources
+        return data_map, used_source, provider_cls, symbol_sources, attempt_records
 
     def _emit(
         symbol: str,
@@ -424,7 +502,13 @@ def fetch_market_data(
         for row in records:
             for key, value in row.items():
                 row[key] = _json_safe(value)
-        results[symbol] = df if as_frames else cap_rows(records, max_rows)
+        capped = cap_rows(records, max_rows)
+        results[symbol] = df if as_frames else capped
+        if full_provenance:
+            row_counts[str(symbol)] = len(df.index) if as_frames else len(records)
+            latest_by_symbol[str(symbol)] = _frame_tail(df)
+            if not as_frames and isinstance(capped, dict) and capped.get("truncated") is True:
+                truncated_symbols.add(str(symbol))
         if include_provenance:
             volume_units = getattr(provider_cls, "volume_units", None) or {}
             frame_attrs = getattr(df, "attrs", None)
@@ -452,9 +536,20 @@ def fetch_market_data(
             provenance[symbol] = entry
 
     for (src, market), src_codes in groups.items():
-        data_map, used_source, provider_cls, symbol_sources = _fetch_via_chain(
+        data_map, used_source, provider_cls, symbol_sources, attempt_records = _fetch_via_chain(
             src, market, src_codes
         )
+        if full_provenance:
+            group_run: dict[str, Any] = {
+                "detected_source": src,
+                "market": market,
+                "requested_symbols": list(src_codes),
+                "attempts": attempt_records,
+                "venue_fallbacks": [],
+            }
+            group_runs.append(group_run)
+            for code in src_codes:
+                group_for_code[code] = group_run
         for symbol, df in data_map.items():
             symbol_source, symbol_provider_cls = symbol_sources.get(
                 symbol, (used_source, provider_cls)
@@ -507,6 +602,17 @@ def fetch_market_data(
                         "venue_fallback": True,
                         "resolved_symbol": sibling,
                     }
+                if full_provenance:
+                    row_counts[code] = row_counts.get(sibling, 0)
+                    latest_by_symbol[code] = latest_by_symbol.get(sibling)
+                    if sibling in truncated_symbols:
+                        truncated_symbols.add(code)
+                    group_for_code[code]["venue_fallbacks"].append({
+                        "requested_symbol": code,
+                        "resolved_symbol": sibling,
+                        "status": "reused_resolved_sibling",
+                        "attempts": [],
+                    })
                 logger.info(
                     "market-data venue alias %s -> %s (source=%s)", code, sibling, src,
                 )
@@ -514,9 +620,18 @@ def fetch_market_data(
                 continue
             # Sibling not already resolved — targeted re-fetch of just that
             # symbol through the same market's source chain.
-            sibling_data, used_source, provider_cls, _ = _fetch_via_chain(
+            sibling_data, used_source, provider_cls, _, alias_attempts = _fetch_via_chain(
                 src, market, [sibling]
             )
+            alias_record: dict[str, Any] | None = None
+            if full_provenance:
+                alias_record = {
+                    "requested_symbol": code,
+                    "resolved_symbol": sibling,
+                    "status": "unresolved",
+                    "attempts": alias_attempts,
+                }
+                group_for_code[code]["venue_fallbacks"].append(alias_record)
             if sibling_data:
                 df = next(iter(sibling_data.values()))
                 if df is not None and not df.empty:
@@ -529,6 +644,8 @@ def fetch_market_data(
                             "resolved_symbol": sibling,
                         },
                     )
+                    if alias_record is not None:
+                        alias_record["status"] = "resolved"
                     logger.info(
                         "market-data venue fallback %s -> %s (source=%s)",
                         code, sibling, src,
@@ -537,8 +654,124 @@ def fetch_market_data(
 
     if unresolved:
         results["_unresolved"] = unresolved
-    if include_provenance and provenance:
-        results["_provenance"] = provenance
+    if include_provenance and not full_provenance and provenance:
+        results[PROVENANCE_KEY] = provenance
+
+    if full_provenance:
+        requests: list[dict[str, Any]] = []
+        for group_run in group_runs:
+            requested = group_run["requested_symbols"]
+            resolved = [
+                code for code in requested
+                if code in results or result_aliases[code] in results
+            ]
+            missing = [code for code in requested if code not in resolved]
+            actual_keys = {
+                code: code if code in results else result_aliases[code]
+                for code in resolved
+            }
+            sources = {
+                code: provenance[actual_keys[code]]["source"]
+                for code in resolved if actual_keys[code] in provenance
+            }
+            unique_sources = set(sources.values())
+            used_source = next(iter(unique_sources)) if len(unique_sources) == 1 else None
+            fallback_used = any(
+                provenance[actual_keys[code]].get("fallback_used") is True
+                for code in resolved if actual_keys[code] in provenance
+            )
+            group_truncated = sorted(
+                code for code in resolved if actual_keys[code] in truncated_symbols
+            )
+            quality = (
+                "unresolved" if missing else
+                "degraded_fallback" if fallback_used else
+                "display_truncated" if group_truncated else "normal"
+            )
+            requests.append({
+                "requested_source": source,
+                "detected_source": group_run["detected_source"],
+                "provider_family": _provider_family(used_source),
+                "used_source": used_source,
+                "used_source_by_symbol": sources,
+                "fallback_used": fallback_used,
+                "is_fallback": fallback_used,
+                "fallback_chain_attempted": [
+                    attempt["source"] for attempt in group_run["attempts"]
+                ],
+                "attempts": group_run["attempts"],
+                "venue_fallbacks": group_run["venue_fallbacks"],
+                "status": "unresolved" if not resolved else "partial" if missing else "ok",
+                "quality": quality,
+                "requested_symbols": requested,
+                "resolved_symbols": resolved,
+                "unresolved_symbols": missing,
+                "row_counts": {
+                    code: row_counts[actual_keys[code]]
+                    for code in resolved if actual_keys[code] in row_counts
+                },
+                "latest_returned_bar_by_symbol": {
+                    code: latest_by_symbol[actual_keys[code]]
+                    for code in resolved if actual_keys[code] in latest_by_symbol
+                },
+                "data_as_of": {
+                    code: latest_by_symbol[actual_keys[code]]
+                    for code in resolved if actual_keys[code] in latest_by_symbol
+                },
+                "truncated_symbols": group_truncated,
+                "is_truncated": bool(group_truncated),
+                "start_date": start_date,
+                "end_date": end_date,
+                "interval": interval,
+                "max_rows": max_rows,
+                "retrieved_at": retrieved_at,
+                "last_bar_status": "not_exchange_session_verified",
+                "tail_semantics": (
+                    "provider-returned-tail; exchange-session completion and report cutoff "
+                    "must be validated by the caller"
+                ),
+            })
+
+        fallback_used = any(request["fallback_used"] for request in requests)
+        is_truncated = bool(truncated_symbols)
+        quality = (
+            "unresolved" if unresolved else
+            "degraded_fallback" if fallback_used else
+            "display_truncated" if is_truncated else "normal"
+        )
+        results[PROVENANCE_KEY] = {
+            # Keep v0.1.15's direct per-symbol fields for existing callers.
+            **provenance,
+            "schema_version": PROVENANCE_SCHEMA,
+            "requested_symbols": list(codes),
+            "requested_source": source,
+            "interval": interval,
+            "start_date": start_date,
+            "end_date": end_date,
+            "max_rows": max_rows,
+            "retrieved_at": retrieved_at,
+            "unresolved_symbols": unresolved,
+            "quality": quality,
+            "fallback_used": fallback_used,
+            "is_fallback": fallback_used,
+            "truncated_symbols": sorted(truncated_symbols),
+            "is_truncated": is_truncated,
+            "data_as_of": latest_by_symbol,
+            "last_bar_status": "not_exchange_session_verified",
+            "calculation_warning": (
+                "one or more symbol series were display-truncated; use max_rows=0 "
+                "for technical calculations" if is_truncated else None
+            ),
+            "symbol_provenance": provenance,
+            "requests": requests,
+            "notes": [
+                "yahoo and yfinance share one provider family for independence analysis",
+                "per-symbol volume units and price adjustment are in symbol_provenance",
+                "provider-returned timestamps do not prove exchange-session completion",
+                "news and issuer-event verification are separate from this OHLCV envelope",
+            ],
+        }
+
     if unresolved:
         results["_diagnostics"] = {
             code: {"attempts": diagnostics.get(code, []), "recovery": (
